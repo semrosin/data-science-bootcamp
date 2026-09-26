@@ -35,7 +35,7 @@
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe solution.py --dataset dataset --output answer.csv
-.\.venv\Scripts\python.exe -m pytest -q --basetemp=.pytest_cache/tmp
+.\.venv\Scripts\python.exe -m pytest -q --basetemp=.pytest_tmp
 ```
 
 Для повторного запуска без настройки весов можно передать

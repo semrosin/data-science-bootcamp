@@ -183,3 +183,4 @@ cython_debug/
 # Local competition data and isolated development workspaces
 dataset/
 .worktrees/
+.pytest_tmp/
