@@ -28,6 +28,7 @@ ITEM_COLUMNS = [
 ]
 QUERY_COLUMNS = ["query_id", "search_query", "search_location_id"]
 ITEM_ID_PATTERN = re.compile(r"[0-9a-f]{16}\Z")
+DEFAULT_SETTING = (0.15, 60.0)
 
 
 def iter_parquet_rows(path: Path, columns: list[str]) -> Iterator[dict]:
@@ -49,17 +50,19 @@ def validate_answer(path: Path, query_ids: set[str], item_ids: set[str]) -> int:
     """Enforce the exact submission contract before delivering the CSV."""
     seen_queries: set[str] = set()
     with path.open(encoding="utf-8", newline="") as stream:
-        reader = csv.DictReader(stream)
-        if reader.fieldnames != ["query_id", "answer"]:
+        reader = csv.reader(stream)
+        if next(reader, None) != ["query_id", "answer"]:
             raise ValueError("CSV must have exactly query_id,answer columns")
         for row in reader:
-            query_id = row["query_id"]
+            if len(row) != 2:
+                raise ValueError("CSV row must have exactly two columns")
+            query_id, answer_text = row
             if query_id not in query_ids:
                 raise ValueError(f"unknown query_id: {query_id}")
             if query_id in seen_queries:
                 raise ValueError(f"duplicate query_id: {query_id}")
             seen_queries.add(query_id)
-            answer = row["answer"].split() if row["answer"] else []
+            answer = answer_text.split()
             if len(answer) > 50:
                 raise ValueError(f"too many items for {query_id}")
             if len(answer) != len(set(answer)):
@@ -104,16 +107,46 @@ def validation_pairs(train_path: Path, item_ids: set[str], size: int, seed: int 
     return [(key, groups[key]) for text in texts for key in [rng.choice(by_text[text])]]
 
 
-def tune_weights(index: RetrievalIndex, train_path: Path, size: int = 500):
-    """Choose two simple scoring hyperparameters on a labeled proxy sample."""
-    pairs = validation_pairs(train_path, set(index.item_ids), size)
+def mean_recall_at_50(
+    index: RetrievalIndex,
+    pairs: list[tuple[tuple[str, int, str], set[str]]],
+    setting: tuple[float, float],
+) -> float:
+    """Average per-query recall on historical positive pairs."""
+    if not pairs:
+        raise ValueError("Recall@50 needs at least one labeled query")
+    total = 0.0
+    for (query, location_id, _filters), relevant in pairs:
+        title_scores, body_scores = index.score_components(query)
+        found = index.rank(
+            title_scores,
+            body_scores,
+            location_id,
+            50,
+            title_weight=setting[0],
+            location_multiplier=setting[1],
+        )
+        total += len(set(found) & relevant) / len(relevant)
+    return total / len(pairs)
+
+
+def tune_weights(
+    index: RetrievalIndex, train_path: Path, size: int = 1500, holdout_size: int = 500
+):
+    """Tune on distinct texts and report recall on a disjoint held-out sample."""
+    pairs = validation_pairs(train_path, set(index.item_ids), size + holdout_size)
+    tuning_pairs, holdout_pairs = pairs[:size], pairs[size:]
+    if not tuning_pairs:
+        raise ValueError(
+            "No labeled queries from train.parquet occur in the item corpus"
+        )
     settings = [
         (weight, location)
         for weight in (0.0, 0.15, 0.3, 0.45)
         for location in (12.0, 20.0, 35.0, 60.0)
     ]
     totals = {setting: 0.0 for setting in settings}
-    for (query, location_id, _filters), relevant in pairs:
+    for (query, location_id, _filters), relevant in tuning_pairs:
         title_scores, body_scores = index.score_components(query)
         for setting in settings:
             found = index.rank(
@@ -125,9 +158,12 @@ def tune_weights(index: RetrievalIndex, train_path: Path, size: int = 500):
                 location_multiplier=setting[1],
             )
             totals[setting] += len(set(found) & relevant) / len(relevant)
-    scores = {setting: total / len(pairs) for setting, total in totals.items()}
+    scores = {setting: total / len(tuning_pairs) for setting, total in totals.items()}
     best = max(scores, key=lambda setting: scores[setting])
-    return best, scores, len(pairs)
+    holdout_recall = (
+        mean_recall_at_50(index, holdout_pairs, best) if holdout_pairs else None
+    )
+    return best, scores, len(tuning_pairs), holdout_recall, len(holdout_pairs)
 
 
 def main() -> None:
@@ -136,6 +172,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("answer.csv"))
     parser.add_argument("--validation-size", type=int, default=1500)
     args = parser.parse_args()
+    if args.validation_size < 0:
+        parser.error("--validation-size must be non-negative")
     dataset = args.dataset
 
     print("Building sparse item index...", flush=True)
@@ -144,18 +182,24 @@ def main() -> None:
     )
     print(f"Indexed {len(index.item_ids)} items", flush=True)
     if args.validation_size:
-        setting, scores, count = tune_weights(
+        setting, scores, count, holdout_recall, holdout_count = tune_weights(
             index, dataset / "train.parquet", args.validation_size
         )
-        print(f"Proxy validation: {count} distinct query texts", flush=True)
+        print(f"Proxy tuning: {count} distinct query texts", flush=True)
         for candidate, recall in sorted(
             scores.items(), key=lambda pair: pair[1], reverse=True
         ):
             print(
                 f"  title_weight={candidate[0]:.2f} location_multiplier={candidate[1]:.1f}: Recall@50={recall:.4f}"
             )
+        if holdout_recall is not None:
+            print(
+                f"Held-out proxy Recall@50={holdout_recall:.4f} "
+                f"on {holdout_count} other query texts",
+                flush=True,
+            )
     else:
-        setting = (0.6, 1.7)
+        setting = DEFAULT_SETTING
 
     queries = list(
         iter_parquet_rows(dataset / "benchmark_queries.parquet", QUERY_COLUMNS)
