@@ -25,6 +25,8 @@
 
 ## Воспроизведение
 
+Решение проверено на Python 3.14.2.
+
 Положите `train.parquet`, `benchmark_items.parquet` и
 `benchmark_queries.parquet` в `dataset/` рядом с `solution.py`, затем из корня
 репозитория выполните в PowerShell:
@@ -33,6 +35,12 @@
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe solution.py --dataset dataset --output answer.csv
+```
+
+Для запуска тестов установите зависимости разработки:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m pytest -q --basetemp=.pytest_tmp
 ```
 
