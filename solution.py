@@ -1,0 +1,182 @@
+"""Build and check a local candidate-generation submission.
+
+Run ``python solution.py --dataset dataset --output answer.csv`` after placing
+the three Parquet files from the assignment in ``dataset/``. The held-out
+proxy validation uses historical train pairs, not benchmark labels.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import random
+import re
+from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from pathlib import Path
+
+import pyarrow.parquet as pq
+
+from retrieval import RetrievalIndex
+
+ITEM_COLUMNS = [
+    "item_id",
+    "item_title_raw",
+    "item_description_raw",
+    "item_infm_params_text",
+    "item_location_id",
+]
+QUERY_COLUMNS = ["query_id", "search_query", "search_location_id"]
+ITEM_ID_PATTERN = re.compile(r"[0-9a-f]{16}\Z")
+
+
+def iter_parquet_rows(path: Path, columns: list[str]) -> Iterator[dict]:
+    """Read large Parquet files in batches instead of materializing a table."""
+    parquet = pq.ParquetFile(path)
+    for batch in parquet.iter_batches(batch_size=2048, columns=columns):
+        yield from batch.to_pylist()
+
+
+def write_answer(path: Path, predictions: Iterable[tuple[str, list[str]]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["query_id", "answer"])
+        for query_id, item_ids in predictions:
+            writer.writerow([query_id, " ".join(item_ids)])
+
+
+def validate_answer(path: Path, query_ids: set[str], item_ids: set[str]) -> int:
+    """Enforce the exact submission contract before delivering the CSV."""
+    seen_queries: set[str] = set()
+    with path.open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames != ["query_id", "answer"]:
+            raise ValueError("CSV must have exactly query_id,answer columns")
+        for row in reader:
+            query_id = row["query_id"]
+            if query_id not in query_ids:
+                raise ValueError(f"unknown query_id: {query_id}")
+            if query_id in seen_queries:
+                raise ValueError(f"duplicate query_id: {query_id}")
+            seen_queries.add(query_id)
+            answer = row["answer"].split() if row["answer"] else []
+            if len(answer) > 50:
+                raise ValueError(f"too many items for {query_id}")
+            if len(answer) != len(set(answer)):
+                raise ValueError(f"duplicate item_id for {query_id}")
+            if any(not ITEM_ID_PATTERN.fullmatch(item) for item in answer):
+                raise ValueError(f"invalid item_id format for {query_id}")
+            if any(item not in item_ids for item in answer):
+                raise ValueError(f"unknown item_id for {query_id}")
+    if seen_queries != query_ids:
+        raise ValueError(f"missing {len(query_ids - seen_queries)} query IDs")
+    return len(seen_queries)
+
+
+def validation_pairs(train_path: Path, item_ids: set[str], size: int, seed: int = 42):
+    """Sample distinct historical query texts with labels in today's corpus.
+
+    A query may have several chosen items; its Recall@50 denominator uses all
+    available items for the selected query/location/filter combination.
+    """
+    groups: dict[tuple[str, int, str], set[str]] = defaultdict(set)
+    columns = [
+        "search_query",
+        "search_location_id",
+        "search_infm_params_text",
+        "item_id",
+    ]
+    for row in iter_parquet_rows(train_path, columns):
+        if row["item_id"] in item_ids and row["search_query"]:
+            key = (
+                row["search_query"],
+                row["search_location_id"],
+                row["search_infm_params_text"] or "",
+            )
+            groups[key].add(row["item_id"])
+
+    # Each text appears once in the sample, mirroring unique benchmark texts.
+    by_text: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    for key in groups:
+        by_text[key[0]].append(key)
+    rng = random.Random(seed)
+    texts = rng.sample(sorted(by_text), min(size, len(by_text)))
+    return [(key, groups[key]) for text in texts for key in [rng.choice(by_text[text])]]
+
+
+def tune_weights(index: RetrievalIndex, train_path: Path, size: int = 500):
+    """Choose two simple scoring hyperparameters on a labeled proxy sample."""
+    pairs = validation_pairs(train_path, set(index.item_ids), size)
+    settings = [
+        (weight, location)
+        for weight in (0.0, 0.15, 0.3, 0.45)
+        for location in (12.0, 20.0, 35.0, 60.0)
+    ]
+    totals = {setting: 0.0 for setting in settings}
+    for (query, location_id, _filters), relevant in pairs:
+        title_scores, body_scores = index.score_components(query)
+        for setting in settings:
+            found = index.rank(
+                title_scores,
+                body_scores,
+                location_id,
+                50,
+                title_weight=setting[0],
+                location_multiplier=setting[1],
+            )
+            totals[setting] += len(set(found) & relevant) / len(relevant)
+    scores = {setting: total / len(pairs) for setting, total in totals.items()}
+    best = max(scores, key=lambda setting: scores[setting])
+    return best, scores, len(pairs)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", type=Path, default=Path("dataset"))
+    parser.add_argument("--output", type=Path, default=Path("answer.csv"))
+    parser.add_argument("--validation-size", type=int, default=1500)
+    args = parser.parse_args()
+    dataset = args.dataset
+
+    print("Building sparse item index...", flush=True)
+    index = RetrievalIndex(
+        iter_parquet_rows(dataset / "benchmark_items.parquet", ITEM_COLUMNS)
+    )
+    print(f"Indexed {len(index.item_ids)} items", flush=True)
+    if args.validation_size:
+        setting, scores, count = tune_weights(
+            index, dataset / "train.parquet", args.validation_size
+        )
+        print(f"Proxy validation: {count} distinct query texts", flush=True)
+        for candidate, recall in sorted(
+            scores.items(), key=lambda pair: pair[1], reverse=True
+        ):
+            print(
+                f"  title_weight={candidate[0]:.2f} location_multiplier={candidate[1]:.1f}: Recall@50={recall:.4f}"
+            )
+    else:
+        setting = (0.6, 1.7)
+
+    queries = list(
+        iter_parquet_rows(dataset / "benchmark_queries.parquet", QUERY_COLUMNS)
+    )
+    predictions = []
+    for row in queries:
+        title_scores, body_scores = index.score_components(row["search_query"] or "")
+        selected = index.rank(
+            title_scores,
+            body_scores,
+            row["search_location_id"],
+            title_weight=setting[0],
+            location_multiplier=setting[1],
+        )
+        predictions.append((row["query_id"], selected))
+    write_answer(args.output, predictions)
+    count = validate_answer(
+        args.output, {q["query_id"] for q in queries}, set(index.item_ids)
+    )
+    print(f"Validated {count} query rows in {args.output}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
