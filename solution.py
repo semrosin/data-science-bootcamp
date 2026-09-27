@@ -18,6 +18,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from priors import CategoryPrior, LocationPrior, collect_training_counts
+from ranker import rank_candidates, train_ranker
 from retrieval import RetrievalIndex, normalize_text
 
 ITEM_COLUMNS = [
@@ -27,8 +28,18 @@ ITEM_COLUMNS = [
     "item_infm_params_text",
     "item_location_id",
     "item_microcat_id",
+    "item_rating_reviews_count",
+    "item_rating",
+    "item_price",
+    "item_is_phone_hidden",
+    "item_is_message_forbidden",
 ]
-QUERY_COLUMNS = ["query_id", "search_query", "search_location_id"]
+QUERY_COLUMNS = [
+    "query_id",
+    "search_query",
+    "search_location_id",
+    "search_infm_params_text",
+]
 TRAIN_PRIOR_COLUMNS = [
     "search_query",
     "search_location_id",
@@ -40,6 +51,7 @@ ITEM_ID_PATTERN = re.compile(r"[0-9a-f]{16}\Z")
 DEFAULT_SETTING = (0.2, 30.0)
 CATEGORY_BOOST = 4.0
 LOCATION_EXPONENT = 0.4
+RANKER_TRAIN_SIZE = 8000
 
 
 def iter_parquet_rows(path: Path, columns: list[str]) -> Iterator[dict]:
@@ -87,7 +99,13 @@ def validate_answer(path: Path, query_ids: set[str], item_ids: set[str]) -> int:
     return len(seen_queries)
 
 
-def validation_pairs(train_path: Path, item_ids: set[str], size: int, seed: int = 42):
+def validation_pairs(
+    train_path: Path,
+    item_ids: set[str],
+    size: int,
+    seed: int = 42,
+    excluded_texts: set[str] | None = None,
+):
     """Sample distinct historical query texts with labels in today's corpus.
 
     A query may have several chosen items; its Recall@50 denominator uses all
@@ -115,7 +133,8 @@ def validation_pairs(train_path: Path, item_ids: set[str], size: int, seed: int 
     for key in groups:
         by_text[key[0]].append(key)
     rng = random.Random(seed)
-    texts = rng.sample(sorted(by_text), min(size, len(by_text)))
+    available = sorted(set(by_text) - (excluded_texts or set()))
+    texts = rng.sample(available, min(size, len(available)))
     return [(key, groups[key]) for text in texts for key in [rng.choice(by_text[text])]]
 
 
@@ -181,6 +200,22 @@ def evaluate_with_priors(
     return total / len(pairs)
 
 
+def evaluate_ranker(
+    index: RetrievalIndex,
+    category_prior: CategoryPrior,
+    location_prior: LocationPrior,
+    model,
+    pairs: list[tuple[tuple[str, int, str], set[str]]],
+) -> float:
+    total = 0.0
+    for (query, location_id, filter_text), relevant in pairs:
+        found = rank_candidates(
+            index, category_prior, location_prior, model, query, location_id, filter_text
+        )
+        total += len(set(found) & relevant) / len(relevant)
+    return total / len(pairs)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=Path("dataset"))
@@ -208,30 +243,57 @@ def main() -> None:
         multiplier=DEFAULT_SETTING[1],
         exponent=LOCATION_EXPONENT,
     )
+    heldout = []
     if args.validation_size:
-        pairs = validation_pairs(
-            dataset / "train.parquet", set(index.item_ids), args.validation_size
+        heldout = validation_pairs(
+            dataset / "train.parquet", set(index.item_ids), args.validation_size, seed=23
         )
-        baseline = mean_recall_at_50(index, pairs, (0.15, 60.0))
-        improved = evaluate_with_priors(index, category_prior, location_prior, pairs)
+    training_pairs = validation_pairs(
+        dataset / "train.parquet",
+        set(index.item_ids),
+        RANKER_TRAIN_SIZE,
+        seed=55,
+        excluded_texts={key[0] for key, _ in heldout},
+    )
+    print(f"Training reranker on {len(training_pairs)} distinct query texts...", flush=True)
+    model = train_ranker(index, category_prior, location_prior, training_pairs)
+    if heldout:
+        baseline = evaluate_with_priors(index, category_prior, location_prior, heldout)
+        reranked = (
+            evaluate_ranker(index, category_prior, location_prior, model, heldout)
+            if model is not None
+            else baseline
+        )
         print(
-            f"Proxy Recall@50 on {len(pairs)} texts: "
-            f"previous={baseline:.4f}, improved={improved:.4f}",
+            f"Proxy Recall@50 on {len(heldout)} unseen texts: "
+            f"sparse={baseline:.4f}, reranked={reranked:.4f}",
             flush=True,
         )
+        training_pairs = validation_pairs(
+            dataset / "train.parquet", set(index.item_ids), RANKER_TRAIN_SIZE, seed=55
+        )
+        model = train_ranker(index, category_prior, location_prior, training_pairs)
 
     queries = list(
         iter_parquet_rows(dataset / "benchmark_queries.parquet", QUERY_COLUMNS)
     )
     predictions = []
     for row in queries:
-        selected = retrieve_with_priors(
-            index,
-            category_prior,
-            location_prior,
-            row["search_query"] or "",
-            row["search_location_id"],
-        )
+        query = row["search_query"] or ""
+        if model is not None and normalize_text(query) not in category_prior.counts:
+            selected = rank_candidates(
+                index,
+                category_prior,
+                location_prior,
+                model,
+                query,
+                row["search_location_id"],
+                row["search_infm_params_text"] or "",
+            )
+        else:
+            selected = retrieve_with_priors(
+                index, category_prior, location_prior, query, row["search_location_id"]
+            )
         predictions.append((row["query_id"], selected))
     write_answer(args.output, predictions)
     count = validate_answer(

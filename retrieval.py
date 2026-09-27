@@ -27,6 +27,7 @@ class RetrievalIndex:
         titles: list[str] = []
         bodies: list[str] = []
         microcats: list[int] = []
+        attributes: list[list[float]] = []
         microcat_rows: dict[int, list[int]] = defaultdict(list)
         seen: set[str] = set()
 
@@ -49,6 +50,17 @@ class RetrievalIndex:
             description = normalize_text(item["item_description_raw"])[:1400]
             parameters = normalize_text(item["item_infm_params_text"])[:600]
             bodies.append(f"{titles[-1]} {description} {parameters}")
+            attributes.append(
+                [
+                    float(item.get("item_rating_reviews_count") or 0),
+                    float(item.get("item_rating") or 0),
+                    float(item.get("item_price") or 0),
+                    float(bool(item.get("item_is_phone_hidden"))),
+                    float(bool(item.get("item_is_message_forbidden"))),
+                    float(len(item["item_title_raw"] or "")),
+                    float(len(item["item_description_raw"] or "")),
+                ]
+            )
 
         if not ids:
             raise ValueError("The item corpus is empty")
@@ -56,6 +68,9 @@ class RetrievalIndex:
         self.item_ids = ids
         self.locations = np.asarray(locations, dtype=np.int64)
         self.microcats = np.asarray(microcats, dtype=np.int64)
+        self.attributes = np.nan_to_num(
+            np.asarray(attributes, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+        )
         self.microcat_rows = {
             category: np.asarray(rows, dtype=np.int32)
             for category, rows in microcat_rows.items()

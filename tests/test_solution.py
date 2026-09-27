@@ -60,6 +60,11 @@ def test_no_validation_still_uses_training_priors(tmp_path, monkeypatch):
             "item_infm_params_text": "",
             "item_location_id": 1,
             "item_microcat_id": 7,
+            "item_price": 0,
+            "item_rating": 0,
+            "item_rating_reviews_count": 0,
+            "item_is_phone_hidden": False,
+            "item_is_message_forbidden": False,
         },
         {
             "item_id": "0000000000000002",
@@ -68,6 +73,11 @@ def test_no_validation_still_uses_training_priors(tmp_path, monkeypatch):
             "item_infm_params_text": "",
             "item_location_id": 1,
             "item_microcat_id": 8,
+            "item_price": 0,
+            "item_rating": 0,
+            "item_rating_reviews_count": 0,
+            "item_is_phone_hidden": False,
+            "item_is_message_forbidden": False,
         },
     ]
     queries = [
@@ -75,6 +85,7 @@ def test_no_validation_still_uses_training_priors(tmp_path, monkeypatch):
             "query_id": "AbCdEfGh12345678",
             "search_query": "television repair",
             "search_location_id": 1,
+            "search_infm_params_text": "",
         }
     ]
     pq.write_table(pa.Table.from_pylist(items), tmp_path / "benchmark_items.parquet")
@@ -90,6 +101,7 @@ def test_no_validation_still_uses_training_priors(tmp_path, monkeypatch):
                     "item_id": "other-item",
                     "item_location_id": 1,
                     "item_microcat_id": 8,
+                    "search_infm_params_text": "",
                 }
             ]
         ),
