@@ -91,3 +91,36 @@ def test_retrieval_uses_category_prior_to_break_text_tie():
     )
 
     assert found[0] == "0000000000000002"
+
+
+def test_retrieval_preserves_zero_category_id():
+    items = [
+        {
+            "item_id": "0000000000000001",
+            "item_title_raw": "Ремонт техники",
+            "item_description_raw": "",
+            "item_infm_params_text": "",
+            "item_location_id": 10,
+            "item_microcat_id": 8,
+        },
+        {
+            "item_id": "0000000000000002",
+            "item_title_raw": "Ремонт техники",
+            "item_description_raw": "",
+            "item_infm_params_text": "",
+            "item_location_id": 10,
+            "item_microcat_id": 0,
+        },
+    ]
+    index = RetrievalIndex(items)
+    title, body = index.score_components("ремонт техники")
+
+    found = index.rank(
+        title,
+        body,
+        location_id=10,
+        category_probabilities={0: 1.0},
+        category_boost=4,
+    )
+
+    assert found[0] == "0000000000000002"

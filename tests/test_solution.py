@@ -6,7 +6,7 @@ import pytest
 
 import solution
 from retrieval import RetrievalIndex
-from solution import main, validate_answer, write_answer
+from solution import main, validate_answer, validation_pairs, write_answer
 
 
 def test_write_answer_preserves_ids_and_exact_columns(tmp_path):
@@ -160,3 +160,32 @@ def test_mean_recall_at_50_averages_over_queries():
     assert (
         solution.mean_recall_at_50(RetrievalIndex(items), pairs, (0.15, 60.0)) == 0.75
     )
+
+
+def test_validation_groups_whitespace_variants_as_one_text(tmp_path):
+    path = tmp_path / "train.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "search_query": "Ремонт телевизора",
+                    "search_location_id": 1,
+                    "search_infm_params_text": "",
+                    "item_id": "0000000000000001",
+                },
+                {
+                    "search_query": "  ремонт   телевизора ",
+                    "search_location_id": 1,
+                    "search_infm_params_text": "",
+                    "item_id": "0000000000000002",
+                },
+            ]
+        ),
+        path,
+    )
+
+    pairs = validation_pairs(path, {"0000000000000001", "0000000000000002"}, size=10)
+
+    assert pairs == [
+        (("ремонт телевизора", 1, ""), {"0000000000000001", "0000000000000002"})
+    ]

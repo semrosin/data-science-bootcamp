@@ -18,7 +18,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from priors import CategoryPrior, LocationPrior, collect_training_counts
-from retrieval import RetrievalIndex
+from retrieval import RetrievalIndex, normalize_text
 
 ITEM_COLUMNS = [
     "item_id",
@@ -101,9 +101,10 @@ def validation_pairs(train_path: Path, item_ids: set[str], size: int, seed: int 
         "item_id",
     ]
     for row in iter_parquet_rows(train_path, columns):
-        if row["item_id"] in item_ids and row["search_query"]:
+        query_text = normalize_text(row["search_query"])
+        if row["item_id"] in item_ids and query_text:
             key = (
-                row["search_query"],
+                query_text,
                 row["search_location_id"],
                 row["search_infm_params_text"] or "",
             )

@@ -5,6 +5,10 @@ def test_normalize_text_folds_case_and_yo():
     assert normalize_text("ЁлКа") == "елка"
 
 
+def test_normalize_text_collapses_whitespace():
+    assert normalize_text("  Ремонт   телевизора\n") == "ремонт телевизора"
+
+
 def test_retrieval_prefers_relevant_local_item():
     items = [
         {

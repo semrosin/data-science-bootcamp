@@ -17,7 +17,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 def normalize_text(value: str | None) -> str:
     """Make Russian text consistent across queries and item fields."""
-    return (value or "").casefold().replace("ё", "е")
+    return " ".join((value or "").casefold().replace("ё", "е").split())
 
 
 class RetrievalIndex:
@@ -36,8 +36,11 @@ class RetrievalIndex:
                 continue
             seen.add(item_id)
             ids.append(item_id)
-            locations.append(item["item_location_id"] or -1)
-            microcat = item.get("item_microcat_id") or -1
+            item_location = item["item_location_id"]
+            locations.append(-1 if item_location is None else item_location)
+            microcat = item.get("item_microcat_id")
+            if microcat is None:
+                microcat = -1
             microcats.append(microcat)
             microcat_rows[microcat].append(len(ids) - 1)
             titles.append(normalize_text(item["item_title_raw"]))
