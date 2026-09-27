@@ -8,7 +8,6 @@ from collections.abc import Iterable
 import numpy as np
 from lightgbm import LGBMClassifier
 
-from click_memory import ClickMemory
 from priors import CategoryPrior, LocationPrior
 from retrieval import RetrievalIndex, normalize_text
 
@@ -31,12 +30,9 @@ FEATURE_NAMES = (
     "has_filter",
     "base_rank",
     "filter_body_score",
-    "history_score",
-    "history_count_log",
 )
 CANDIDATE_LIMIT = 300
 FILTER_CANDIDATE_LIMIT = 100
-HISTORY_CANDIDATE_LIMIT = 100
 
 
 def candidate_features(
@@ -48,9 +44,6 @@ def candidate_features(
     filter_text: str,
     *,
     exclude_exact: bool = True,
-    click_memory: ClickMemory | None = None,
-    use_history_candidates: bool = False,
-    use_history_count: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return the best lexical candidates and finite reranking features."""
     title, body = index.score_components(query)
@@ -84,26 +77,11 @@ def candidate_features(
             )[-FILTER_CANDIDATE_LIMIT:]
             filter_matches = filter_matches[top]
         matched = np.union1d(matched, filter_matches)
-    history_scores = (
-        click_memory.query_scores(query, exclude_exact=exclude_exact)
-        if click_memory is not None and use_history_candidates
-        else {}
-    )
-    if history_scores:
-        leaders = sorted(history_scores, key=lambda row: (-history_scores[row], row))[
-            :HISTORY_CANDIDATE_LIMIT
-        ]
-        matched = np.union1d(matched, leaders)
     selected = matched[np.lexsort((matched, -scores[matched]))]
     if not len(selected):
         return selected, np.empty((0, len(FEATURE_NAMES)), dtype=np.float32), scores[selected]
 
     attributes = index.attributes[selected]
-    history_counts = (
-        click_memory.item_counts(selected, query, exclude_exact=exclude_exact)
-        if click_memory is not None and use_history_count
-        else np.zeros(len(selected), dtype=np.int32)
-    )
     features = np.column_stack(
         [
             title[selected],
@@ -124,8 +102,6 @@ def candidate_features(
             np.full(len(selected), bool(filter_text)),
             np.arange(len(selected)) / (CANDIDATE_LIMIT + FILTER_CANDIDATE_LIMIT),
             filter_scores[selected],
-            np.asarray([history_scores.get(int(row), 0) for row in selected]),
-            np.log1p(history_counts),
         ]
     ).astype(np.float32)
     return selected, features, scores[selected]
@@ -136,10 +112,6 @@ def train_ranker(
     category_prior: CategoryPrior,
     location_prior: LocationPrior,
     pairs: Iterable[tuple[tuple[str, int, str], set[str]]],
-    *,
-    click_memory: ClickMemory | None = None,
-    use_history_candidates: bool = False,
-    use_history_count: bool = False,
 ) -> LGBMClassifier | None:
     """Train on distinct queries with positives and sampled negatives."""
     rng = random.Random(55)
@@ -147,15 +119,7 @@ def train_ranker(
     training_labels: list[np.ndarray] = []
     for (query, location_id, filter_text), relevant in pairs:
         selected, features, _ = candidate_features(
-            index,
-            category_prior,
-            location_prior,
-            query,
-            location_id,
-            filter_text,
-            click_memory=click_memory,
-            use_history_candidates=use_history_candidates,
-            use_history_count=use_history_count,
+            index, category_prior, location_prior, query, location_id, filter_text
         )
         labels = np.array(
             [index.item_ids[position] in relevant for position in selected], dtype=np.int8
@@ -201,20 +165,9 @@ def rank_candidates(
     filter_text: str,
     *,
     limit: int = 50,
-    click_memory: ClickMemory | None = None,
-    use_history_candidates: bool = False,
-    use_history_count: bool = False,
 ) -> list[str]:
     selected, features, _ = candidate_features(
-        index,
-        category_prior,
-        location_prior,
-        query,
-        location_id,
-        filter_text,
-        click_memory=click_memory,
-        use_history_candidates=use_history_candidates,
-        use_history_count=use_history_count,
+        index, category_prior, location_prior, query, location_id, filter_text
     )
     if not len(selected):
         return []

@@ -17,7 +17,6 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
-from click_memory import ClickMemory
 from priors import CategoryPrior, LocationPrior, collect_training_counts
 from ranker import rank_candidates, train_ranker
 from retrieval import RetrievalIndex, normalize_text
@@ -53,8 +52,6 @@ DEFAULT_SETTING = (0.2, 30.0)
 CATEGORY_BOOST = 4.0
 LOCATION_EXPONENT = 0.4
 RANKER_TRAIN_SIZE = 8000
-USE_HISTORY_CANDIDATES = True
-USE_HISTORY_COUNT = True
 
 
 def iter_parquet_rows(path: Path, columns: list[str]) -> Iterator[dict]:
@@ -209,21 +206,11 @@ def evaluate_ranker(
     location_prior: LocationPrior,
     model,
     pairs: list[tuple[tuple[str, int, str], set[str]]],
-    click_memory: ClickMemory | None = None,
 ) -> float:
     total = 0.0
     for (query, location_id, filter_text), relevant in pairs:
         found = rank_candidates(
-            index,
-            category_prior,
-            location_prior,
-            model,
-            query,
-            location_id,
-            filter_text,
-            click_memory=click_memory,
-            use_history_candidates=click_memory is not None,
-            use_history_count=click_memory is not None,
+            index, category_prior, location_prior, model, query, location_id, filter_text
         )
         total += len(set(found) & relevant) / len(relevant)
     return total / len(pairs)
@@ -261,35 +248,19 @@ def main() -> None:
         heldout = validation_pairs(
             dataset / "train.parquet", set(index.item_ids), args.validation_size, seed=23
         )
-    reserved_texts = {key[0] for key, _ in heldout}
-    click_memory = ClickMemory(
-        iter_parquet_rows(dataset / "train.parquet", ["search_query", "item_id"]),
-        index.item_ids,
-        excluded_texts=reserved_texts,
-    )
     training_pairs = validation_pairs(
         dataset / "train.parquet",
         set(index.item_ids),
         RANKER_TRAIN_SIZE,
         seed=55,
-        excluded_texts=reserved_texts,
+        excluded_texts={key[0] for key, _ in heldout},
     )
     print(f"Training reranker on {len(training_pairs)} distinct query texts...", flush=True)
-    model = train_ranker(
-        index,
-        category_prior,
-        location_prior,
-        training_pairs,
-        click_memory=click_memory,
-        use_history_candidates=USE_HISTORY_CANDIDATES,
-        use_history_count=USE_HISTORY_COUNT,
-    )
+    model = train_ranker(index, category_prior, location_prior, training_pairs)
     if heldout:
         baseline = evaluate_with_priors(index, category_prior, location_prior, heldout)
         reranked = (
-            evaluate_ranker(
-                index, category_prior, location_prior, model, heldout, click_memory
-            )
+            evaluate_ranker(index, category_prior, location_prior, model, heldout)
             if model is not None
             else baseline
         )
@@ -301,19 +272,7 @@ def main() -> None:
         training_pairs = validation_pairs(
             dataset / "train.parquet", set(index.item_ids), RANKER_TRAIN_SIZE, seed=55
         )
-        click_memory = ClickMemory(
-            iter_parquet_rows(dataset / "train.parquet", ["search_query", "item_id"]),
-            index.item_ids,
-        )
-        model = train_ranker(
-            index,
-            category_prior,
-            location_prior,
-            training_pairs,
-            click_memory=click_memory,
-            use_history_candidates=USE_HISTORY_CANDIDATES,
-            use_history_count=USE_HISTORY_COUNT,
-        )
+        model = train_ranker(index, category_prior, location_prior, training_pairs)
 
     queries = list(
         iter_parquet_rows(dataset / "benchmark_queries.parquet", QUERY_COLUMNS)
@@ -330,9 +289,6 @@ def main() -> None:
                 query,
                 row["search_location_id"],
                 row["search_infm_params_text"] or "",
-                click_memory=click_memory,
-                use_history_candidates=USE_HISTORY_CANDIDATES,
-                use_history_count=USE_HISTORY_COUNT,
             )
         else:
             selected = retrieve_with_priors(
