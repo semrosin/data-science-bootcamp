@@ -73,7 +73,7 @@ def write_answer(path: Path, predictions: Iterable[tuple[str, list[str]]]) -> No
 def merge_rankings(
     baseline: list[str], reranked: list[str], *, replacements: int, limit: int = 50
 ) -> list[str]:
-    """Keep the strongest baseline items and fill a small budget from the ranker."""
+    """Keep the first baseline items; replace at most N when baseline has 50."""
     preserved = baseline[: max(0, limit - replacements)]
     result = list(preserved)
     if len(result) >= limit:

@@ -168,6 +168,20 @@ def main() -> None:
             flush=True,
         )
 
+    # This second model uses precisely the text exclusion used for answer.csv.
+    submitted_training = validation_pairs(
+        dataset / "train.parquet",
+        item_ids,
+        RANKER_TRAIN_SIZE,
+        seed=55,
+        excluded_texts=known_texts,
+    )
+    submitted_model = train_ranker(
+        index, category_prior, location_prior, submitted_training
+    )
+    if submitted_model is None:
+        raise ValueError("No known-query training pairs")
+
     exact_keys = {
         (
             normalize_text(row["search_query"]),
@@ -198,7 +212,14 @@ def main() -> None:
         relevant = exact_groups.get(key)
         if relevant:
             direct_scores.append(
-                compare_pair(index, category_prior, location_prior, model, key, relevant)
+                compare_pair(
+                    index,
+                    category_prior,
+                    location_prior,
+                    submitted_model,
+                    key,
+                    relevant,
+                )
             )
     direct = np.asarray(direct_scores)
     full_direct = direct[direct[:, 2] == 50]
