@@ -2,7 +2,7 @@ from collections import Counter
 
 import pytest
 
-from evaluate_known import frequency_bucket, weighted_recall
+from experiments.evaluate_known import frequency_bucket, weighted_recall
 
 
 def test_frequency_bucket_separates_rare_and_common_texts():
