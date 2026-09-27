@@ -32,6 +32,7 @@ FEATURE_NAMES = (
     "filter_body_score",
 )
 CANDIDATE_LIMIT = 300
+FILTER_CANDIDATE_LIMIT = 100
 
 
 def candidate_features(
@@ -56,19 +57,29 @@ def candidate_features(
         if rows is not None:
             category_prob[rows] = probability
     scores = base * geo * (1 + 3 * category_prob)
-    matched = np.flatnonzero(scores > 0)
-    if len(matched) > CANDIDATE_LIMIT:
-        top = np.argpartition(scores[matched], -CANDIDATE_LIMIT)[-CANDIDATE_LIMIT:]
-        matched = matched[top]
-    selected = matched[np.lexsort((matched, -scores[matched]))]
-    if not len(selected):
-        return selected, np.empty((0, len(FEATURE_NAMES)), dtype=np.float32), scores[selected]
-
     if filter_text:
         filter_vector = index.body_vectorizer.transform([normalize_text(filter_text)])
         filter_scores = index._cosine_scores(index.body_matrix, filter_vector)
     else:
         filter_scores = np.zeros(len(index.item_ids), dtype=np.float32)
+    matched = np.flatnonzero(scores > 0)
+    if len(matched) > CANDIDATE_LIMIT:
+        top = np.argpartition(scores[matched], -CANDIDATE_LIMIT)[-CANDIDATE_LIMIT:]
+        matched = matched[top]
+    if filter_text:
+        filter_candidate_scores = (
+            filter_scores * geo * (1 + 3 * category_prob) * np.sqrt(base)
+        )
+        filter_matches = np.flatnonzero(filter_candidate_scores > 0)
+        if len(filter_matches) > FILTER_CANDIDATE_LIMIT:
+            top = np.argpartition(
+                filter_candidate_scores[filter_matches], -FILTER_CANDIDATE_LIMIT
+            )[-FILTER_CANDIDATE_LIMIT:]
+            filter_matches = filter_matches[top]
+        matched = np.union1d(matched, filter_matches)
+    selected = matched[np.lexsort((matched, -scores[matched]))]
+    if not len(selected):
+        return selected, np.empty((0, len(FEATURE_NAMES)), dtype=np.float32), scores[selected]
 
     attributes = index.attributes[selected]
     features = np.column_stack(
@@ -89,7 +100,7 @@ def candidate_features(
             np.log1p(np.maximum(attributes[:, 6], 0)),
             np.full(len(selected), len(normalize_text(query).split())),
             np.full(len(selected), bool(filter_text)),
-            np.arange(len(selected)) / CANDIDATE_LIMIT,
+            np.arange(len(selected)) / (CANDIDATE_LIMIT + FILTER_CANDIDATE_LIMIT),
             filter_scores[selected],
         ]
     ).astype(np.float32)
