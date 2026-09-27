@@ -51,21 +51,23 @@ def test_validate_answer_rejects_blank_csv_row(tmp_path):
         validate_answer(path, {"AbCdEfGh12345678"}, {"0123456789abcdef"})
 
 
-def test_no_tuning_uses_documented_retrieval_weights(tmp_path, monkeypatch):
+def test_no_validation_still_uses_training_priors(tmp_path, monkeypatch):
     items = [
         {
             "item_id": "0000000000000001",
-            "item_title_raw": "General services",
+            "item_title_raw": "Television repair",
             "item_description_raw": "Television repair",
             "item_infm_params_text": "",
             "item_location_id": 1,
+            "item_microcat_id": 7,
         },
         {
             "item_id": "0000000000000002",
             "item_title_raw": "Television repair",
             "item_description_raw": "Television repair",
             "item_infm_params_text": "",
-            "item_location_id": 2,
+            "item_location_id": 1,
+            "item_microcat_id": 8,
         },
     ]
     queries = [
@@ -78,6 +80,20 @@ def test_no_tuning_uses_documented_retrieval_weights(tmp_path, monkeypatch):
     pq.write_table(pa.Table.from_pylist(items), tmp_path / "benchmark_items.parquet")
     pq.write_table(
         pa.Table.from_pylist(queries), tmp_path / "benchmark_queries.parquet"
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "search_query": "television repair",
+                    "search_location_id": 1,
+                    "item_id": "other-item",
+                    "item_location_id": 1,
+                    "item_microcat_id": 8,
+                }
+            ]
+        ),
+        tmp_path / "train.parquet",
     )
     output = tmp_path / "answer.csv"
     monkeypatch.setattr(
@@ -97,7 +113,7 @@ def test_no_tuning_uses_documented_retrieval_weights(tmp_path, monkeypatch):
 
     with output.open(encoding="utf-8", newline="") as stream:
         rows = list(csv.DictReader(stream))
-    assert rows[0]["answer"].split()[0] == "0000000000000001"
+    assert rows[0]["answer"].split()[0] == "0000000000000002"
 
 
 def test_negative_validation_size_is_rejected_before_loading_data(

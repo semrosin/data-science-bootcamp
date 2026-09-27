@@ -1,8 +1,8 @@
 """Build and check a local candidate-generation submission.
 
 Run ``python solution.py --dataset dataset --output answer.csv`` after placing
-the three Parquet files from the assignment in ``dataset/``. The held-out
-proxy validation uses historical train pairs, not benchmark labels.
+the three Parquet files from the assignment in ``dataset/``. Proxy validation
+uses historical train pairs, not benchmark labels.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
+from priors import CategoryPrior, LocationPrior, collect_training_counts
 from retrieval import RetrievalIndex
 
 ITEM_COLUMNS = [
@@ -25,10 +26,20 @@ ITEM_COLUMNS = [
     "item_description_raw",
     "item_infm_params_text",
     "item_location_id",
+    "item_microcat_id",
 ]
 QUERY_COLUMNS = ["query_id", "search_query", "search_location_id"]
+TRAIN_PRIOR_COLUMNS = [
+    "search_query",
+    "search_location_id",
+    "item_id",
+    "item_location_id",
+    "item_microcat_id",
+]
 ITEM_ID_PATTERN = re.compile(r"[0-9a-f]{16}\Z")
-DEFAULT_SETTING = (0.15, 60.0)
+DEFAULT_SETTING = (0.2, 30.0)
+CATEGORY_BOOST = 4.0
+LOCATION_EXPONENT = 0.4
 
 
 def iter_parquet_rows(path: Path, columns: list[str]) -> Iterator[dict]:
@@ -130,47 +141,50 @@ def mean_recall_at_50(
     return total / len(pairs)
 
 
-def tune_weights(
-    index: RetrievalIndex, train_path: Path, size: int = 1500, holdout_size: int = 500
-):
-    """Tune on distinct texts and report recall on a disjoint held-out sample."""
-    pairs = validation_pairs(train_path, set(index.item_ids), size + holdout_size)
-    tuning_pairs, holdout_pairs = pairs[:size], pairs[size:]
-    if not tuning_pairs:
-        raise ValueError(
-            "No labeled queries from train.parquet occur in the item corpus"
-        )
-    settings = [
-        (weight, location)
-        for weight in (0.0, 0.15, 0.3, 0.45)
-        for location in (12.0, 20.0, 35.0, 60.0)
-    ]
-    totals = {setting: 0.0 for setting in settings}
-    for (query, location_id, _filters), relevant in tuning_pairs:
-        title_scores, body_scores = index.score_components(query)
-        for setting in settings:
-            found = index.rank(
-                title_scores,
-                body_scores,
-                location_id,
-                50,
-                title_weight=setting[0],
-                location_multiplier=setting[1],
-            )
-            totals[setting] += len(set(found) & relevant) / len(relevant)
-    scores = {setting: total / len(tuning_pairs) for setting, total in totals.items()}
-    best = max(scores, key=lambda setting: scores[setting])
-    holdout_recall = (
-        mean_recall_at_50(index, holdout_pairs, best) if holdout_pairs else None
+def retrieve_with_priors(
+    index: RetrievalIndex,
+    category_prior: CategoryPrior,
+    location_prior: LocationPrior,
+    query: str,
+    location_id: int,
+    exclude_exact: bool = False,
+) -> list[str]:
+    """Apply text similarity, geographic behavior, and service type together."""
+    title, body = index.score_components(query)
+    return index.rank(
+        title,
+        body,
+        location_id,
+        title_weight=DEFAULT_SETTING[0],
+        location_weights=location_prior.weights(location_id),
+        category_probabilities=category_prior.predict(query, exclude_exact),
+        category_boost=CATEGORY_BOOST,
     )
-    return best, scores, len(tuning_pairs), holdout_recall, len(holdout_pairs)
+
+
+def evaluate_with_priors(
+    index: RetrievalIndex,
+    category_prior: CategoryPrior,
+    location_prior: LocationPrior,
+    pairs: list[tuple[tuple[str, int, str], set[str]]],
+) -> float:
+    """Exclude each evaluated query's exact training labels from the prior."""
+    if not pairs:
+        raise ValueError("Recall@50 needs at least one labeled query")
+    total = 0.0
+    for (query, location_id, _filters), relevant in pairs:
+        found = retrieve_with_priors(
+            index, category_prior, location_prior, query, location_id, True
+        )
+        total += len(set(found) & relevant) / len(relevant)
+    return total / len(pairs)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=Path("dataset"))
     parser.add_argument("--output", type=Path, default=Path("answer.csv"))
-    parser.add_argument("--validation-size", type=int, default=1500)
+    parser.add_argument("--validation-size", type=int, default=1200)
     args = parser.parse_args()
     if args.validation_size < 0:
         parser.error("--validation-size must be non-negative")
@@ -181,38 +195,41 @@ def main() -> None:
         iter_parquet_rows(dataset / "benchmark_items.parquet", ITEM_COLUMNS)
     )
     print(f"Indexed {len(index.item_ids)} items", flush=True)
+    print("Learning query and location priors from train.parquet...", flush=True)
+    categories, transitions = collect_training_counts(
+        iter_parquet_rows(dataset / "train.parquet", TRAIN_PRIOR_COLUMNS),
+        set(index.item_ids),
+    )
+    category_prior = CategoryPrior(categories)
+    location_prior = LocationPrior(
+        index.locations,
+        transitions,
+        multiplier=DEFAULT_SETTING[1],
+        exponent=LOCATION_EXPONENT,
+    )
     if args.validation_size:
-        setting, scores, count, holdout_recall, holdout_count = tune_weights(
-            index, dataset / "train.parquet", args.validation_size
+        pairs = validation_pairs(
+            dataset / "train.parquet", set(index.item_ids), args.validation_size
         )
-        print(f"Proxy tuning: {count} distinct query texts", flush=True)
-        for candidate, recall in sorted(
-            scores.items(), key=lambda pair: pair[1], reverse=True
-        ):
-            print(
-                f"  title_weight={candidate[0]:.2f} location_multiplier={candidate[1]:.1f}: Recall@50={recall:.4f}"
-            )
-        if holdout_recall is not None:
-            print(
-                f"Held-out proxy Recall@50={holdout_recall:.4f} "
-                f"on {holdout_count} other query texts",
-                flush=True,
-            )
-    else:
-        setting = DEFAULT_SETTING
+        baseline = mean_recall_at_50(index, pairs, (0.15, 60.0))
+        improved = evaluate_with_priors(index, category_prior, location_prior, pairs)
+        print(
+            f"Proxy Recall@50 on {len(pairs)} texts: "
+            f"previous={baseline:.4f}, improved={improved:.4f}",
+            flush=True,
+        )
 
     queries = list(
         iter_parquet_rows(dataset / "benchmark_queries.parquet", QUERY_COLUMNS)
     )
     predictions = []
     for row in queries:
-        title_scores, body_scores = index.score_components(row["search_query"] or "")
-        selected = index.rank(
-            title_scores,
-            body_scores,
+        selected = retrieve_with_priors(
+            index,
+            category_prior,
+            location_prior,
+            row["search_query"] or "",
             row["search_location_id"],
-            title_weight=setting[0],
-            location_multiplier=setting[1],
         )
         predictions.append((row["query_id"], selected))
     write_answer(args.output, predictions)

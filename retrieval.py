@@ -8,6 +8,7 @@ fitted only on the item corpus; no benchmark labels are used.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Iterable
 
 import numpy as np
@@ -25,6 +26,8 @@ class RetrievalIndex:
         locations: list[int] = []
         titles: list[str] = []
         bodies: list[str] = []
+        microcats: list[int] = []
+        microcat_rows: dict[int, list[int]] = defaultdict(list)
         seen: set[str] = set()
 
         for item in items:
@@ -34,6 +37,9 @@ class RetrievalIndex:
             seen.add(item_id)
             ids.append(item_id)
             locations.append(item["item_location_id"] or -1)
+            microcat = item.get("item_microcat_id") or -1
+            microcats.append(microcat)
+            microcat_rows[microcat].append(len(ids) - 1)
             titles.append(normalize_text(item["item_title_raw"]))
             # Long descriptions often contain repeated tags and boilerplate.
             # Capping them reduces memory and keeps the service itself salient.
@@ -46,6 +52,11 @@ class RetrievalIndex:
 
         self.item_ids = ids
         self.locations = np.asarray(locations, dtype=np.int64)
+        self.microcats = np.asarray(microcats, dtype=np.int64)
+        self.microcat_rows = {
+            category: np.asarray(rows, dtype=np.int32)
+            for category, rows in microcat_rows.items()
+        }
         self.title_vectorizer = TfidfVectorizer(
             analyzer="char_wb",
             ngram_range=(3, 5),
@@ -91,6 +102,9 @@ class RetrievalIndex:
         limit: int = 50,
         title_weight: float = 0.6,
         location_multiplier: float = 1.7,
+        location_weights: np.ndarray | None = None,
+        category_probabilities: dict[int, float] | None = None,
+        category_boost: float = 4.0,
     ) -> list[str]:
         """Combine lexical evidence and prefer exact-city matches.
 
@@ -99,7 +113,14 @@ class RetrievalIndex:
         """
         scores = title_weight * title_scores + (1 - title_weight) * body_scores
         scores = scores.copy()
-        scores[self.locations == location_id] *= location_multiplier
+        if location_weights is None:
+            scores[self.locations == location_id] *= location_multiplier
+        else:
+            scores *= location_weights
+        for category, probability in (category_probabilities or {}).items():
+            rows = self.microcat_rows.get(category)
+            if rows is not None:
+                scores[rows] *= 1 + (category_boost - 1) * probability
         matched = np.flatnonzero(scores > 0)
         if not len(matched):
             return []
