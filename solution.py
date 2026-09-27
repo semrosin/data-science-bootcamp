@@ -52,6 +52,7 @@ DEFAULT_SETTING = (0.2, 30.0)
 CATEGORY_BOOST = 4.0
 LOCATION_EXPONENT = 0.4
 RANKER_TRAIN_SIZE = 8000
+KNOWN_RANKER_REPLACEMENTS = 10
 
 
 def iter_parquet_rows(path: Path, columns: list[str]) -> Iterator[dict]:
@@ -67,6 +68,24 @@ def write_answer(path: Path, predictions: Iterable[tuple[str, list[str]]]) -> No
         writer.writerow(["query_id", "answer"])
         for query_id, item_ids in predictions:
             writer.writerow([query_id, " ".join(item_ids)])
+
+
+def merge_rankings(
+    baseline: list[str], reranked: list[str], *, replacements: int, limit: int = 50
+) -> list[str]:
+    """Keep the strongest baseline items and fill a small budget from the ranker."""
+    preserved = baseline[: max(0, limit - replacements)]
+    result = list(preserved)
+    if len(result) >= limit:
+        return result[:limit]
+    seen = set(result)
+    for item_id in [*reranked, *baseline[len(preserved) :]]:
+        if item_id not in seen:
+            result.append(item_id)
+            seen.add(item_id)
+            if len(result) >= limit:
+                break
+    return result
 
 
 def validate_answer(path: Path, query_ids: set[str], item_ids: set[str]) -> int:
@@ -277,10 +296,53 @@ def main() -> None:
     queries = list(
         iter_parquet_rows(dataset / "benchmark_queries.parquet", QUERY_COLUMNS)
     )
+    known_texts = {
+        normalize_text(row["search_query"])
+        for row in queries
+        if normalize_text(row["search_query"]) in category_prior.counts
+    }
+    known_model = None
+    if model is not None and known_texts:
+        known_training_pairs = validation_pairs(
+            dataset / "train.parquet",
+            set(index.item_ids),
+            RANKER_TRAIN_SIZE,
+            seed=55,
+            excluded_texts=known_texts,
+        )
+        print(
+            f"Training known-query reranker on {len(known_training_pairs)} "
+            "other query texts...",
+            flush=True,
+        )
+        known_model = train_ranker(
+            index, category_prior, location_prior, known_training_pairs
+        )
     predictions = []
     for row in queries:
         query = row["search_query"] or ""
-        if model is not None and normalize_text(query) not in category_prior.counts:
+        if normalize_text(query) in known_texts:
+            baseline = retrieve_with_priors(
+                index, category_prior, location_prior, query, row["search_location_id"]
+            )
+            if known_model is not None:
+                reranked = rank_candidates(
+                    index,
+                    category_prior,
+                    location_prior,
+                    known_model,
+                    query,
+                    row["search_location_id"],
+                    row["search_infm_params_text"] or "",
+                    limit=100,
+                    exclude_exact=False,
+                )
+                selected = merge_rankings(
+                    baseline, reranked, replacements=KNOWN_RANKER_REPLACEMENTS
+                )
+            else:
+                selected = baseline
+        elif model is not None:
             selected = rank_candidates(
                 index,
                 category_prior,

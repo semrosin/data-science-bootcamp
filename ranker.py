@@ -165,9 +165,16 @@ def rank_candidates(
     filter_text: str,
     *,
     limit: int = 50,
+    exclude_exact: bool = True,
 ) -> list[str]:
     selected, features, _ = candidate_features(
-        index, category_prior, location_prior, query, location_id, filter_text
+        index,
+        category_prior,
+        location_prior,
+        query,
+        location_id,
+        filter_text,
+        exclude_exact=exclude_exact,
     )
     if not len(selected):
         return []
